@@ -1,6 +1,6 @@
 /***
     This file is part of snapcast
-    Copyright (C) 2014-2023  Johannes Pohl
+    Copyright (C) 2014-2025  Johannes Pohl
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -25,10 +25,13 @@
 // 3rd party headers
 #include <CoreAudio/CoreAudio.h>
 
+// standard headers
+#include <thread>
+
 namespace player
 {
 
-#define NUM_BUFFERS 2
+#define NUM_BUFFERS 3
 
 static constexpr auto LOG_TAG = "CoreAudioPlayer";
 
@@ -43,13 +46,22 @@ void callback(void* custom_data, AudioQueueRef queue, AudioQueueBufferRef buffer
 
 
 CoreAudioPlayer::CoreAudioPlayer(boost::asio::io_context& io_context, const ClientSettings::Player& settings, std::shared_ptr<Stream> stream)
-    : Player(io_context, settings, stream), ms_(100), pubStream_(stream)
+    : Player(io_context, settings, stream), ms_(40), pubStream_(stream), lastChunkTick(chronos::getTickCount()), hasReceivedChunk_(false),
+      stopRequested_(false), audioQueue_(nullptr), workerRunLoop_(nullptr), pendingStop_(false)
 {
 }
 
 
 CoreAudioPlayer::~CoreAudioPlayer()
 {
+    try
+    {
+        stop();
+    }
+    catch (const std::exception& e)
+    {
+        LOG(ERROR, LOG_TAG) << "Exception during CoreAudioPlayer shutdown: " << e.what() << "\n";
+    }
 }
 
 
@@ -114,19 +126,19 @@ void CoreAudioPlayer::playerCallback(AudioQueueRef queue, AudioQueueBufferRef bu
     /// TODO: sometimes this bufferedMS or AudioTimeStamp wraps around 1s (i.e. we're 1s out of sync (behind)) and recovers later on
     chronos::usec delay(bufferedMs * 1000);
     char* buffer = (char*)bufferRef->mAudioData;
-    if (!pubStream_->getPlayerChunkOrSilence(buffer, delay, frames_))
+    bool haveData = pubStream_->getPlayerChunkOrSilence(buffer, delay, frames_);
+    if (!haveData)
     {
-        if (chronos::getTickCount() - lastChunkTick > 5000)
+        if (hasReceivedChunk_)
         {
-            LOG(NOTICE, LOG_TAG) << "No chunk received for 5000ms. Closing Audio Queue.\n";
-            uninitAudioQueue(queue);
-            return;
+            LOG(TRACE, LOG_TAG) << "Under-run: served silence but continuing playback\n";
         }
-        // LOG(INFO, LOG_TAG) << "Failed to get chunk. Playing silence.\n";
+        lastChunkTick = chronos::getTickCount();
     }
     else
     {
         lastChunkTick = chronos::getTickCount();
+        hasReceivedChunk_ = true;
         adjustVolume(buffer, frames_);
     }
 
@@ -135,7 +147,7 @@ void CoreAudioPlayer::playerCallback(AudioQueueRef queue, AudioQueueBufferRef bu
 
     if (!active_)
     {
-        uninitAudioQueue(queue);
+        requestStop(queue);
     }
 }
 
@@ -182,7 +194,11 @@ void CoreAudioPlayer::initAudioQueue()
     format.mReserved = 0;
 
     AudioQueueRef queue;
-    AudioQueueNewOutput(&format, callback, this, CFRunLoopGetCurrent(), kCFRunLoopCommonModes, 0, &queue);
+    OSStatus status = AudioQueueNewOutput(&format, callback, this, CFRunLoopGetCurrent(), kCFRunLoopCommonModes, 0, &queue);
+    if (status != noErr)
+    {
+        throw std::runtime_error("AudioQueueNewOutput failed: " + std::to_string(status));
+    }
     AudioQueueCreateTimeline(queue, &timeLine_);
 
     // Apple recommends this as buffer size:
@@ -192,7 +208,7 @@ void CoreAudioPlayer::initAudioQueue()
     //
     // For 100ms @ 48000:16:2 we have 19.2K
     // frames: 4800, ms: 100, buffer size: 19200
-    frames_ = (sampleFormat.rate() * ms_) / 1000;
+    frames_ = std::max<size_t>(1, (sampleFormat.rate() * ms_) / 1000);
     ms_ = frames_ * 1000 / sampleFormat.rate();
     buff_size_ = frames_ * sampleFormat.frameSize();
     LOG(INFO, LOG_TAG) << "frames: " << frames_ << ", ms: " << ms_ << ", buffer size: " << buff_size_ << "\n";
@@ -205,18 +221,84 @@ void CoreAudioPlayer::initAudioQueue()
         callback(this, queue, buffers[i]);
     }
 
-    LOG(DEBUG, LOG_TAG) << "CoreAudioPlayer::worker\n";
+    LOG(DEBUG, LOG_TAG) << "CoreAudioPlayer::worker starting run loop on thread " << std::this_thread::get_id() << "\n";
     AudioQueueCreateTimeline(queue, &timeLine_);
+    stopRequested_.store(false);
+    pendingStop_.store(false);
+    hasReceivedChunk_ = false;
+    lastChunkTick = chronos::getTickCount();
+    {
+        std::lock_guard<std::mutex> lock(audioQueueMutex_);
+        audioQueue_ = queue;
+        workerRunLoop_ = CFRunLoopGetCurrent();
+    }
     AudioQueueStart(queue, NULL);
     CFRunLoopRun();
+    LOG(DEBUG, LOG_TAG) << "CoreAudioPlayer::worker run loop exited on thread " << std::this_thread::get_id() << "\n";
+    AudioQueueRef queueRef = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(audioQueueMutex_);
+        queueRef = audioQueue_;
+        audioQueue_ = nullptr;
+        workerRunLoop_ = nullptr;
+    }
+    finalizeStop(queueRef);
 }
 
-void CoreAudioPlayer::uninitAudioQueue(AudioQueueRef queue)
+void CoreAudioPlayer::requestStop(AudioQueueRef queue)
 {
-    AudioQueueStop(queue, false);
-    AudioQueueDispose(queue, false);
+    LOG(TRACE, LOG_TAG) << "requestStop called (queue=" << queue << ", thread=" << std::this_thread::get_id() << ")\n";
+    bool expected = false;
+    if (!stopRequested_.compare_exchange_strong(expected, true))
+    {
+        LOG(TRACE, LOG_TAG) << "requestStop already pending, ignoring duplicate request\n";
+        return;
+    }
+    LOG(DEBUG, LOG_TAG) << "requestStop initiating stop sequence\n";
+    pendingStop_.store(true);
+    CFRunLoopRef runLoop = nullptr;
+    AudioQueueRef queueRef = queue;
+    {
+        std::lock_guard<std::mutex> lock(audioQueueMutex_);
+        if (queueRef == nullptr)
+            queueRef = audioQueue_;
+        runLoop = workerRunLoop_;
+    }
+
+    if (queueRef)
+    {
+        LOG(TRACE, LOG_TAG) << "requestStop calling AudioQueueStop (async)\n";
+        AudioQueueStop(queueRef, false);
+    }
     pubStream_->clearChunks();
-    CFRunLoopStop(CFRunLoopGetCurrent());
+    if (runLoop)
+    {
+        CFRetain(runLoop);
+        CFRunLoopPerformBlock(runLoop, kCFRunLoopCommonModes, ^
+        {
+            LOG(TRACE, LOG_TAG) << "requestStop CFRunLoopStop executing on thread " << std::this_thread::get_id() << "\n";
+            CFRunLoopStop(runLoop);
+            CFRelease(runLoop);
+        });
+        CFRunLoopWakeUp(runLoop);
+    }
+}
+
+void CoreAudioPlayer::teardownAudioQueue()
+{
+    requestStop(nullptr);
+}
+
+void CoreAudioPlayer::finalizeStop(AudioQueueRef queue)
+{
+    LOG(TRACE, LOG_TAG) << "finalizeStop called (queue=" << queue << ", pending=" << pendingStop_.load() << ")\n";
+    if (!pendingStop_.exchange(false))
+        return;
+    if (queue)
+    {
+        LOG(TRACE, LOG_TAG) << "finalizeStop disposing audio queue\n";
+        AudioQueueDispose(queue, false);
+    }
 }
 
 } // namespace player
