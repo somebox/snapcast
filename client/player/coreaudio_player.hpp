@@ -27,6 +27,10 @@
 #include <CoreAudio/CoreAudioTypes.h>
 #include <CoreFoundation/CFRunLoop.h>
 
+// standard headers
+#include <atomic>
+#include <mutex>
+
 
 namespace player
 {
@@ -60,7 +64,9 @@ private:
     bool needsThread() const override;
 
     void initAudioQueue();
-    void uninitAudioQueue(AudioQueueRef queue);
+    void teardownAudioQueue();
+    void requestStop(AudioQueueRef queue);
+    void finalizeStop(AudioQueueRef queue);
 
     AudioQueueTimelineRef timeLine_;
     size_t ms_;
@@ -68,6 +74,12 @@ private:
     size_t buff_size_;
     std::shared_ptr<Stream> pubStream_;
     long lastChunkTick;
+    bool hasReceivedChunk_;
+    std::atomic<bool> stopRequested_;
+    AudioQueueRef audioQueue_;
+    CFRunLoopRef workerRunLoop_;
+    std::mutex audioQueueMutex_;
+    std::atomic<bool> pendingStop_; ///< set when callback requested stop but worker not yet done
 };
 
 } // namespace player
